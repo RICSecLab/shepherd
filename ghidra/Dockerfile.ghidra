@@ -1,0 +1,38 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN  apt-get update \
+    && apt-get install -y --no-install-suggests --no-install-recommends \
+    wget unzip openjdk-17-jdk python3 python3-pip graphviz gcc \
+    && wget https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.1.1_build/ghidra_11.1.1_PUBLIC_20240614.zip \
+    && unzip ghidra_11.1.1_PUBLIC_20240614.zip \
+    && rm ghidra_11.1.1_PUBLIC_20240614.zip
+
+RUN wget https://github.com/mandiant/Ghidrathon/releases/download/v4.0.0/Ghidrathon-v4.0.0.zip && \
+    unzip Ghidrathon-v4.0.0.zip -d tmp_ghidrathon
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends \
+    python3-dev
+
+RUN JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 python3 -m pip install -r tmp_ghidrathon/requirements.txt && \
+    JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 python3 tmp_ghidrathon/ghidrathon_configure.py /ghidra_11.1.1_PUBLIC
+
+RUN unzip tmp_ghidrathon/Ghidrathon-v4.0.0.zip -d /ghidra_11.1.1_PUBLIC/Ghidra/Extensions && \
+    rm -rf tmp_ghidrathon Ghidrathon-v4.0.0.zip && \
+    sed -i 's/MAXMEM=2G/MAXMEM=32G/' /ghidra_11.1.1_PUBLIC/support/analyzeHeadless
+
+ARG UID=1000
+RUN useradd --shell /bin/bash -u $UID -o -c "" -m myuser \
+    && mkdir work
+
+WORKDIR /work
+RUN cd /work \
+    && mkdir targets \
+    && mkdir tmp_project \
+    && chown myuser. /work -R \
+    && chown myuser. /ghidra_11.1.1_PUBLIC -R
+
+USER myuser
+
+CMD /ghidra_11.1.1_PUBLIC/support/analyzeHeadless tmp_project tmptarget -deleteProject -import $TARGET_BIN -scriptPath ghidra/ -postScript ghidra/static_analysis_by_ghidra.py

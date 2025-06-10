@@ -1,0 +1,1 @@
+$PUT_BIN --format json @@ --verbosity 3

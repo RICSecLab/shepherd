@@ -1,0 +1,51 @@
+FROM ubuntu:22.04
+
+ARG UID=1000
+RUN useradd --shell /bin/bash -u $UID -o -c "" -m myuser \
+    && mkdir work out corpus eval src
+
+RUN apt-get update \
+    && apt-get install -y --no-install-suggests --no-install-recommends \
+    wget libpopt-dev git curl build-essential make gcc g++ ninja-build cmake \
+    python3.10 python3.10-dev python3-pip python3-setuptools ca-certificates \
+    libpcap-dev vim autoconf perl clang lld llvm-dev 
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends sudo \
+    && echo "myuser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+WORKDIR /work
+RUN cd /work \
+    && chown myuser. /work -R
+
+RUN git clone https://github.com/AFLplusplus/AFLplusplus -b v4.21c --depth 1 orig-aflpp
+RUN cd orig-aflpp \
+    && LLVM_CONFIG=llvm-config-14 make source-only && make install
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends \
+    protobuf-compiler libprotobuf-dev libprotobuf-c-dev libprotobuf-c1 \
+    libprotobuf-lite23 libprotobuf23 automake flex bison \
+    unzip screen make autoconf automake groff libtool pkg-config nasm autopoint 
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends \
+    libgmp-dev libssl-dev zlib1g-dev 
+
+ENV SRC="/src"
+ENV OUT="/out"
+ENV WORK="/work"
+ENV CORPUS="/corpus"
+ENV EVAL="/eval"
+RUN chown myuser. /src /out /corpus /eval -R
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends \
+    texinfo libpng-dev libjpeg-dev libtiff-dev libwebp-dev
+
+RUN sed -i 's|http://security.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y build-essential debhelper bison check cmake flex groff libbsd-dev \
+     libcurl4-openssl-dev libmaxminddb-dev libgtk-3-dev libltdl-dev libluajit-5.1-dev \
+     libncurses5-dev libnet1-dev libpcap-dev libpcre2-dev libssl-dev --fix-missing
+
+RUN apt-get install -y libfontconfig1-dev libfreetype-dev libxml2-dev libssl-dev libjpeg-dev libpng-dev\
+    libtiff-dev libidn11-dev lsb-release software-properties-common gnupg
+
+USER myuser

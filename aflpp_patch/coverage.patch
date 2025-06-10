@@ -1,0 +1,1259 @@
+diff --git a/include/config.h b/include/config.h
+index c4acf8d..2403b50 100644
+--- a/include/config.h
++++ b/include/config.h
+@@ -436,6 +436,7 @@
+    use FORKSRV_FD and FORKSRV_FD + 1): */
+ 
+ #define FORKSRV_FD 198
++#define ORIG_FORKSRV_FD 193
+ 
+ /* Fork server init timeout multiplier: we'll wait the user-selected
+    timeout plus this much for the fork server to spin up. */
+diff --git a/include/forkserver.h b/include/forkserver.h
+index 593e34a..7badf7c 100644
+--- a/include/forkserver.h
++++ b/include/forkserver.h
+@@ -32,6 +32,9 @@
+ #include <stdbool.h>
+ 
+ #include "types.h"
++#include "khash.h"
++
++KHASH_MAP_INIT_INT64(u64_u64HashTable, u64)
+ 
+ #ifdef __linux__
+ /**
+@@ -190,6 +193,28 @@ typedef struct afl_forkserver {
+ 
+   u32 max_length;
+ 
++  u8 *edges_file_path;
++
++  pid_t shepherd_pid;           /* PID of the shepherd estimator server */
++  s32   shepherd_ctl_fd,        /* pipe with shepherd estimator server (write) */
++      shepherd_st_fd;           /* pipe with shepherd estimator server (read)  */
++  pid_t afl_filter_pid;       /* PID of the afl-instrumented bin faux server */
++  pid_t afl_filter_child_pid; /* PID of the afl-instrumented bin faux server
++                                 child */
++  s32 afl_filter_ctl_fd,      /* pipe with the afl-instrumented bin faux server
++                                 (write) */
++      afl_filter_st_fd; /* pipe with the afl-instrumented bin faux server (read)
++                         */
++  u8  is_baseline_mode; /* is baseline mode enabled (dbi) */
++  u8  enable_py_assert; /* enable python assert in the fuzz server */
++
++  khash_t(u64_u64HashTable) * testcase_hashes;
++
++  u8    *afl_put_bin_path; /* path to the instrumented binary (afl_put_bin) */
++  char **afl_argv;         /* argv for the put binary */
++  u8 *virgin_bits; /* virgin bits for the put binary; hit counts are ignored  */
++  u64 start_time;  /* start time of the forkserver */
++
+ #ifdef __linux__
+   nyx_plugin_handler_t *nyx_handlers;
+   char                 *out_dir_path;    /* path to the output directory     */
+diff --git a/include/khash.h b/include/khash.h
+new file mode 100644
+index 0000000..f75f347
+--- /dev/null
++++ b/include/khash.h
+@@ -0,0 +1,627 @@
++/* The MIT License
++
++   Copyright (c) 2008, 2009, 2011 by Attractive Chaos <attractor@live.co.uk>
++
++   Permission is hereby granted, free of charge, to any person obtaining
++   a copy of this software and associated documentation files (the
++   "Software"), to deal in the Software without restriction, including
++   without limitation the rights to use, copy, modify, merge, publish,
++   distribute, sublicense, and/or sell copies of the Software, and to
++   permit persons to whom the Software is furnished to do so, subject to
++   the following conditions:
++
++   The above copyright notice and this permission notice shall be
++   included in all copies or substantial portions of the Software.
++
++   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++   SOFTWARE.
++*/
++
++/*
++  An example:
++
++#include "khash.h"
++KHASH_MAP_INIT_INT(32, char)
++int main() {
++	int ret, is_missing;
++	khiter_t k;
++	khash_t(32) *h = kh_init(32);
++	k = kh_put(32, h, 5, &ret);
++	kh_value(h, k) = 10;
++	k = kh_get(32, h, 10);
++	is_missing = (k == kh_end(h));
++	k = kh_get(32, h, 5);
++	kh_del(32, h, k);
++	for (k = kh_begin(h); k != kh_end(h); ++k)
++		if (kh_exist(h, k)) kh_value(h, k) = 1;
++	kh_destroy(32, h);
++	return 0;
++}
++*/
++
++/*
++  2013-05-02 (0.2.8):
++
++	* Use quadratic probing. When the capacity is power of 2, stepping function
++	  i*(i+1)/2 guarantees to traverse each bucket. It is better than double
++	  hashing on cache performance and is more robust than linear probing.
++
++	  In theory, double hashing should be more robust than quadratic probing.
++	  However, my implementation is probably not for large hash tables, because
++	  the second hash function is closely tied to the first hash function,
++	  which reduce the effectiveness of double hashing.
++
++	Reference: http://research.cs.vt.edu/AVresearch/hashing/quadratic.php
++
++  2011-12-29 (0.2.7):
++
++    * Minor code clean up; no actual effect.
++
++  2011-09-16 (0.2.6):
++
++	* The capacity is a power of 2. This seems to dramatically improve the
++	  speed for simple keys. Thank Zilong Tan for the suggestion. Reference:
++
++	   - http://code.google.com/p/ulib/
++	   - http://nothings.org/computer/judy/
++
++	* Allow to optionally use linear probing which usually has better
++	  performance for random input. Double hashing is still the default as it
++	  is more robust to certain non-random input.
++
++	* Added Wang's integer hash function (not used by default). This hash
++	  function is more robust to certain non-random input.
++
++  2011-02-14 (0.2.5):
++
++    * Allow to declare global functions.
++
++  2009-09-26 (0.2.4):
++
++    * Improve portability
++
++  2008-09-19 (0.2.3):
++
++	* Corrected the example
++	* Improved interfaces
++
++  2008-09-11 (0.2.2):
++
++	* Improved speed a little in kh_put()
++
++  2008-09-10 (0.2.1):
++
++	* Added kh_clear()
++	* Fixed a compiling error
++
++  2008-09-02 (0.2.0):
++
++	* Changed to token concatenation which increases flexibility.
++
++  2008-08-31 (0.1.2):
++
++	* Fixed a bug in kh_get(), which has not been tested previously.
++
++  2008-08-31 (0.1.1):
++
++	* Added destructor
++*/
++
++
++#ifndef __AC_KHASH_H
++#define __AC_KHASH_H
++
++/*!
++  @header
++
++  Generic hash table library.
++ */
++
++#define AC_VERSION_KHASH_H "0.2.8"
++
++#include <stdlib.h>
++#include <string.h>
++#include <limits.h>
++
++/* compiler specific configuration */
++
++#if UINT_MAX == 0xffffffffu
++typedef unsigned int khint32_t;
++#elif ULONG_MAX == 0xffffffffu
++typedef unsigned long khint32_t;
++#endif
++
++#if ULONG_MAX == ULLONG_MAX
++typedef unsigned long khint64_t;
++#else
++typedef unsigned long long khint64_t;
++#endif
++
++#ifndef kh_inline
++#ifdef _MSC_VER
++#define kh_inline __inline
++#else
++#define kh_inline inline
++#endif
++#endif /* kh_inline */
++
++#ifndef klib_unused
++#if (defined __clang__ && __clang_major__ >= 3) || (defined __GNUC__ && __GNUC__ >= 3)
++#define klib_unused __attribute__ ((__unused__))
++#else
++#define klib_unused
++#endif
++#endif /* klib_unused */
++
++typedef khint32_t khint_t;
++typedef khint_t khiter_t;
++
++#define __ac_isempty(flag, i) ((flag[i>>4]>>((i&0xfU)<<1))&2)
++#define __ac_isdel(flag, i) ((flag[i>>4]>>((i&0xfU)<<1))&1)
++#define __ac_iseither(flag, i) ((flag[i>>4]>>((i&0xfU)<<1))&3)
++#define __ac_set_isdel_false(flag, i) (flag[i>>4]&=~(1ul<<((i&0xfU)<<1)))
++#define __ac_set_isempty_false(flag, i) (flag[i>>4]&=~(2ul<<((i&0xfU)<<1)))
++#define __ac_set_isboth_false(flag, i) (flag[i>>4]&=~(3ul<<((i&0xfU)<<1)))
++#define __ac_set_isdel_true(flag, i) (flag[i>>4]|=1ul<<((i&0xfU)<<1))
++
++#define __ac_fsize(m) ((m) < 16? 1 : (m)>>4)
++
++#ifndef kroundup32
++#define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
++#endif
++
++#ifndef kcalloc
++#define kcalloc(N,Z) calloc(N,Z)
++#endif
++#ifndef kmalloc
++#define kmalloc(Z) malloc(Z)
++#endif
++#ifndef krealloc
++#define krealloc(P,Z) realloc(P,Z)
++#endif
++#ifndef kfree
++#define kfree(P) free(P)
++#endif
++
++static const double __ac_HASH_UPPER = 0.77;
++
++#define __KHASH_TYPE(name, khkey_t, khval_t) \
++	typedef struct kh_##name##_s { \
++		khint_t n_buckets, size, n_occupied, upper_bound; \
++		khint32_t *flags; \
++		khkey_t *keys; \
++		khval_t *vals; \
++	} kh_##name##_t;
++
++#define __KHASH_PROTOTYPES(name, khkey_t, khval_t)	 					\
++	extern kh_##name##_t *kh_init_##name(void);							\
++	extern void kh_destroy_##name(kh_##name##_t *h);					\
++	extern void kh_clear_##name(kh_##name##_t *h);						\
++	extern khint_t kh_get_##name(const kh_##name##_t *h, khkey_t key); 	\
++	extern int kh_resize_##name(kh_##name##_t *h, khint_t new_n_buckets); \
++	extern khint_t kh_put_##name(kh_##name##_t *h, khkey_t key, int *ret); \
++	extern void kh_del_##name(kh_##name##_t *h, khint_t x);
++
++#define __KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
++	SCOPE kh_##name##_t *kh_init_##name(void) {							\
++		return (kh_##name##_t*)kcalloc(1, sizeof(kh_##name##_t));		\
++	}																	\
++	SCOPE void kh_destroy_##name(kh_##name##_t *h)						\
++	{																	\
++		if (h) {														\
++			kfree((void *)h->keys); kfree(h->flags);					\
++			kfree((void *)h->vals);										\
++			kfree(h);													\
++		}																\
++	}																	\
++	SCOPE void kh_clear_##name(kh_##name##_t *h)						\
++	{																	\
++		if (h && h->flags) {											\
++			memset(h->flags, 0xaa, __ac_fsize(h->n_buckets) * sizeof(khint32_t)); \
++			h->size = h->n_occupied = 0;								\
++		}																\
++	}																	\
++	SCOPE khint_t kh_get_##name(const kh_##name##_t *h, khkey_t key) 	\
++	{																	\
++		if (h->n_buckets) {												\
++			khint_t k, i, last, mask, step = 0; \
++			mask = h->n_buckets - 1;									\
++			k = __hash_func(key); i = k & mask;							\
++			last = i; \
++			while (!__ac_isempty(h->flags, i) && (__ac_isdel(h->flags, i) || !__hash_equal(h->keys[i], key))) { \
++				i = (i + (++step)) & mask; \
++				if (i == last) return h->n_buckets;						\
++			}															\
++			return __ac_iseither(h->flags, i)? h->n_buckets : i;		\
++		} else return 0;												\
++	}																	\
++	SCOPE int kh_resize_##name(kh_##name##_t *h, khint_t new_n_buckets) \
++	{ /* This function uses 0.25*n_buckets bytes of working space instead of [sizeof(key_t+val_t)+.25]*n_buckets. */ \
++		khint32_t *new_flags = 0;										\
++		khint_t j = 1;													\
++		{																\
++			kroundup32(new_n_buckets); 									\
++			if (new_n_buckets < 4) new_n_buckets = 4;					\
++			if (h->size >= (khint_t)(new_n_buckets * __ac_HASH_UPPER + 0.5)) j = 0;	/* requested size is too small */ \
++			else { /* hash table size to be changed (shrink or expand); rehash */ \
++				new_flags = (khint32_t*)kmalloc(__ac_fsize(new_n_buckets) * sizeof(khint32_t));	\
++				if (!new_flags) return -1;								\
++				memset(new_flags, 0xaa, __ac_fsize(new_n_buckets) * sizeof(khint32_t)); \
++				if (h->n_buckets < new_n_buckets) {	/* expand */		\
++					khkey_t *new_keys = (khkey_t*)krealloc((void *)h->keys, new_n_buckets * sizeof(khkey_t)); \
++					if (!new_keys) { kfree(new_flags); return -1; }		\
++					h->keys = new_keys;									\
++					if (kh_is_map) {									\
++						khval_t *new_vals = (khval_t*)krealloc((void *)h->vals, new_n_buckets * sizeof(khval_t)); \
++						if (!new_vals) { kfree(new_flags); return -1; }	\
++						h->vals = new_vals;								\
++					}													\
++				} /* otherwise shrink */								\
++			}															\
++		}																\
++		if (j) { /* rehashing is needed */								\
++			for (j = 0; j != h->n_buckets; ++j) {						\
++				if (__ac_iseither(h->flags, j) == 0) {					\
++					khkey_t key = h->keys[j];							\
++					khval_t val;										\
++					khint_t new_mask;									\
++					new_mask = new_n_buckets - 1; 						\
++					if (kh_is_map) val = h->vals[j];					\
++					__ac_set_isdel_true(h->flags, j);					\
++					while (1) { /* kick-out process; sort of like in Cuckoo hashing */ \
++						khint_t k, i, step = 0; \
++						k = __hash_func(key);							\
++						i = k & new_mask;								\
++						while (!__ac_isempty(new_flags, i)) i = (i + (++step)) & new_mask; \
++						__ac_set_isempty_false(new_flags, i);			\
++						if (i < h->n_buckets && __ac_iseither(h->flags, i) == 0) { /* kick out the existing element */ \
++							{ khkey_t tmp = h->keys[i]; h->keys[i] = key; key = tmp; } \
++							if (kh_is_map) { khval_t tmp = h->vals[i]; h->vals[i] = val; val = tmp; } \
++							__ac_set_isdel_true(h->flags, i); /* mark it as deleted in the old hash table */ \
++						} else { /* write the element and jump out of the loop */ \
++							h->keys[i] = key;							\
++							if (kh_is_map) h->vals[i] = val;			\
++							break;										\
++						}												\
++					}													\
++				}														\
++			}															\
++			if (h->n_buckets > new_n_buckets) { /* shrink the hash table */ \
++				h->keys = (khkey_t*)krealloc((void *)h->keys, new_n_buckets * sizeof(khkey_t)); \
++				if (kh_is_map) h->vals = (khval_t*)krealloc((void *)h->vals, new_n_buckets * sizeof(khval_t)); \
++			}															\
++			kfree(h->flags); /* free the working space */				\
++			h->flags = new_flags;										\
++			h->n_buckets = new_n_buckets;								\
++			h->n_occupied = h->size;									\
++			h->upper_bound = (khint_t)(h->n_buckets * __ac_HASH_UPPER + 0.5); \
++		}																\
++		return 0;														\
++	}																	\
++	SCOPE khint_t kh_put_##name(kh_##name##_t *h, khkey_t key, int *ret) \
++	{																	\
++		khint_t x;														\
++		if (h->n_occupied >= h->upper_bound) { /* update the hash table */ \
++			if (h->n_buckets > (h->size<<1)) {							\
++				if (kh_resize_##name(h, h->n_buckets - 1) < 0) { /* clear "deleted" elements */ \
++					*ret = -1; return h->n_buckets;						\
++				}														\
++			} else if (kh_resize_##name(h, h->n_buckets + 1) < 0) { /* expand the hash table */ \
++				*ret = -1; return h->n_buckets;							\
++			}															\
++		} /* TODO: to implement automatically shrinking; resize() already support shrinking */ \
++		{																\
++			khint_t k, i, site, last, mask = h->n_buckets - 1, step = 0; \
++			x = site = h->n_buckets; k = __hash_func(key); i = k & mask; \
++			if (__ac_isempty(h->flags, i)) x = i; /* for speed up */	\
++			else {														\
++				last = i; \
++				while (!__ac_isempty(h->flags, i) && (__ac_isdel(h->flags, i) || !__hash_equal(h->keys[i], key))) { \
++					if (__ac_isdel(h->flags, i)) site = i;				\
++					i = (i + (++step)) & mask; \
++					if (i == last) { x = site; break; }					\
++				}														\
++				if (x == h->n_buckets) {								\
++					if (__ac_isempty(h->flags, i) && site != h->n_buckets) x = site; \
++					else x = i;											\
++				}														\
++			}															\
++		}																\
++		if (__ac_isempty(h->flags, x)) { /* not present at all */		\
++			h->keys[x] = key;											\
++			__ac_set_isboth_false(h->flags, x);							\
++			++h->size; ++h->n_occupied;									\
++			*ret = 1;													\
++		} else if (__ac_isdel(h->flags, x)) { /* deleted */				\
++			h->keys[x] = key;											\
++			__ac_set_isboth_false(h->flags, x);							\
++			++h->size;													\
++			*ret = 2;													\
++		} else *ret = 0; /* Don't touch h->keys[x] if present and not deleted */ \
++		return x;														\
++	}																	\
++	SCOPE void kh_del_##name(kh_##name##_t *h, khint_t x)				\
++	{																	\
++		if (x != h->n_buckets && !__ac_iseither(h->flags, x)) {			\
++			__ac_set_isdel_true(h->flags, x);							\
++			--h->size;													\
++		}																\
++	}
++
++#define KHASH_DECLARE(name, khkey_t, khval_t)		 					\
++	__KHASH_TYPE(name, khkey_t, khval_t) 								\
++	__KHASH_PROTOTYPES(name, khkey_t, khval_t)
++
++#define KHASH_INIT2(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
++	__KHASH_TYPE(name, khkey_t, khval_t) 								\
++	__KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)
++
++#define KHASH_INIT(name, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
++	KHASH_INIT2(name, static kh_inline klib_unused, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)
++
++/* --- BEGIN OF HASH FUNCTIONS --- */
++
++/*! @function
++  @abstract     Integer hash function
++  @param  key   The integer [khint32_t]
++  @return       The hash value [khint_t]
++ */
++#define kh_int_hash_func(key) (khint32_t)(key)
++/*! @function
++  @abstract     Integer comparison function
++ */
++#define kh_int_hash_equal(a, b) ((a) == (b))
++/*! @function
++  @abstract     64-bit integer hash function
++  @param  key   The integer [khint64_t]
++  @return       The hash value [khint_t]
++ */
++#define kh_int64_hash_func(key) (khint32_t)((key)>>33^(key)^(key)<<11)
++/*! @function
++  @abstract     64-bit integer comparison function
++ */
++#define kh_int64_hash_equal(a, b) ((a) == (b))
++/*! @function
++  @abstract     const char* hash function
++  @param  s     Pointer to a null terminated string
++  @return       The hash value
++ */
++static kh_inline khint_t __ac_X31_hash_string(const char *s)
++{
++	khint_t h = (khint_t)*s;
++	if (h) for (++s ; *s; ++s) h = (h << 5) - h + (khint_t)*s;
++	return h;
++}
++/*! @function
++  @abstract     Another interface to const char* hash function
++  @param  key   Pointer to a null terminated string [const char*]
++  @return       The hash value [khint_t]
++ */
++#define kh_str_hash_func(key) __ac_X31_hash_string(key)
++/*! @function
++  @abstract     Const char* comparison function
++ */
++#define kh_str_hash_equal(a, b) (strcmp(a, b) == 0)
++
++static kh_inline khint_t __ac_Wang_hash(khint_t key)
++{
++    key += ~(key << 15);
++    key ^=  (key >> 10);
++    key +=  (key << 3);
++    key ^=  (key >> 6);
++    key += ~(key << 11);
++    key ^=  (key >> 16);
++    return key;
++}
++#define kh_int_hash_func2(key) __ac_Wang_hash((khint_t)key)
++
++/* --- END OF HASH FUNCTIONS --- */
++
++/* Other convenient macros... */
++
++/*!
++  @abstract Type of the hash table.
++  @param  name  Name of the hash table [symbol]
++ */
++#define khash_t(name) kh_##name##_t
++
++/*! @function
++  @abstract     Initiate a hash table.
++  @param  name  Name of the hash table [symbol]
++  @return       Pointer to the hash table [khash_t(name)*]
++ */
++#define kh_init(name) kh_init_##name()
++
++/*! @function
++  @abstract     Destroy a hash table.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++ */
++#define kh_destroy(name, h) kh_destroy_##name(h)
++
++/*! @function
++  @abstract     Reset a hash table without deallocating memory.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++ */
++#define kh_clear(name, h) kh_clear_##name(h)
++
++/*! @function
++  @abstract     Resize a hash table.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  s     New size [khint_t]
++ */
++#define kh_resize(name, h, s) kh_resize_##name(h, s)
++
++/*! @function
++  @abstract     Insert a key to the hash table.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  k     Key [type of keys]
++  @param  r     Extra return code: -1 if the operation failed;
++                0 if the key is present in the hash table;
++                1 if the bucket is empty (never used); 2 if the element in
++				the bucket has been deleted [int*]
++  @return       Iterator to the inserted element [khint_t]
++ */
++#define kh_put(name, h, k, r) kh_put_##name(h, k, r)
++
++/*! @function
++  @abstract     Retrieve a key from the hash table.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  k     Key [type of keys]
++  @return       Iterator to the found element, or kh_end(h) if the element is absent [khint_t]
++ */
++#define kh_get(name, h, k) kh_get_##name(h, k)
++
++/*! @function
++  @abstract     Remove a key from the hash table.
++  @param  name  Name of the hash table [symbol]
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  k     Iterator to the element to be deleted [khint_t]
++ */
++#define kh_del(name, h, k) kh_del_##name(h, k)
++
++/*! @function
++  @abstract     Test whether a bucket contains data.
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  x     Iterator to the bucket [khint_t]
++  @return       1 if containing data; 0 otherwise [int]
++ */
++#define kh_exist(h, x) (!__ac_iseither((h)->flags, (x)))
++
++/*! @function
++  @abstract     Get key given an iterator
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  x     Iterator to the bucket [khint_t]
++  @return       Key [type of keys]
++ */
++#define kh_key(h, x) ((h)->keys[x])
++
++/*! @function
++  @abstract     Get value given an iterator
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  x     Iterator to the bucket [khint_t]
++  @return       Value [type of values]
++  @discussion   For hash sets, calling this results in segfault.
++ */
++#define kh_val(h, x) ((h)->vals[x])
++
++/*! @function
++  @abstract     Alias of kh_val()
++ */
++#define kh_value(h, x) ((h)->vals[x])
++
++/*! @function
++  @abstract     Get the start iterator
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @return       The start iterator [khint_t]
++ */
++#define kh_begin(h) (khint_t)(0)
++
++/*! @function
++  @abstract     Get the end iterator
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @return       The end iterator [khint_t]
++ */
++#define kh_end(h) ((h)->n_buckets)
++
++/*! @function
++  @abstract     Get the number of elements in the hash table
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @return       Number of elements in the hash table [khint_t]
++ */
++#define kh_size(h) ((h)->size)
++
++/*! @function
++  @abstract     Get the number of buckets in the hash table
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @return       Number of buckets in the hash table [khint_t]
++ */
++#define kh_n_buckets(h) ((h)->n_buckets)
++
++/*! @function
++  @abstract     Iterate over the entries in the hash table
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  kvar  Variable to which key will be assigned
++  @param  vvar  Variable to which value will be assigned
++  @param  code  Block of code to execute
++ */
++#define kh_foreach(h, kvar, vvar, code) { khint_t __i;		\
++	for (__i = kh_begin(h); __i != kh_end(h); ++__i) {		\
++		if (!kh_exist(h,__i)) continue;						\
++		(kvar) = kh_key(h,__i);								\
++		(vvar) = kh_val(h,__i);								\
++		code;												\
++	} }
++
++/*! @function
++  @abstract     Iterate over the values in the hash table
++  @param  h     Pointer to the hash table [khash_t(name)*]
++  @param  vvar  Variable to which value will be assigned
++  @param  code  Block of code to execute
++ */
++#define kh_foreach_value(h, vvar, code) { khint_t __i;		\
++	for (__i = kh_begin(h); __i != kh_end(h); ++__i) {		\
++		if (!kh_exist(h,__i)) continue;						\
++		(vvar) = kh_val(h,__i);								\
++		code;												\
++	} }
++
++/* More convenient interfaces */
++
++/*! @function
++  @abstract     Instantiate a hash set containing integer keys
++  @param  name  Name of the hash table [symbol]
++ */
++#define KHASH_SET_INIT_INT(name)										\
++	KHASH_INIT(name, khint32_t, char, 0, kh_int_hash_func, kh_int_hash_equal)
++
++/*! @function
++  @abstract     Instantiate a hash map containing integer keys
++  @param  name  Name of the hash table [symbol]
++  @param  khval_t  Type of values [type]
++ */
++#define KHASH_MAP_INIT_INT(name, khval_t)								\
++	KHASH_INIT(name, khint32_t, khval_t, 1, kh_int_hash_func, kh_int_hash_equal)
++
++/*! @function
++  @abstract     Instantiate a hash set containing 64-bit integer keys
++  @param  name  Name of the hash table [symbol]
++ */
++#define KHASH_SET_INIT_INT64(name)										\
++	KHASH_INIT(name, khint64_t, char, 0, kh_int64_hash_func, kh_int64_hash_equal)
++
++/*! @function
++  @abstract     Instantiate a hash map containing 64-bit integer keys
++  @param  name  Name of the hash table [symbol]
++  @param  khval_t  Type of values [type]
++ */
++#define KHASH_MAP_INIT_INT64(name, khval_t)								\
++	KHASH_INIT(name, khint64_t, khval_t, 1, kh_int64_hash_func, kh_int64_hash_equal)
++
++typedef const char *kh_cstr_t;
++/*! @function
++  @abstract     Instantiate a hash map containing const char* keys
++  @param  name  Name of the hash table [symbol]
++ */
++#define KHASH_SET_INIT_STR(name)										\
++	KHASH_INIT(name, kh_cstr_t, char, 0, kh_str_hash_func, kh_str_hash_equal)
++
++/*! @function
++  @abstract     Instantiate a hash map containing const char* keys
++  @param  name  Name of the hash table [symbol]
++  @param  khval_t  Type of values [type]
++ */
++#define KHASH_MAP_INIT_STR(name, khval_t)								\
++	KHASH_INIT(name, kh_cstr_t, khval_t, 1, kh_str_hash_func, kh_str_hash_equal)
++
++#endif /* __AC_KHASH_H */
+diff --git a/src/afl-forkserver.c b/src/afl-forkserver.c
+index 71d8570..b37a025 100644
+--- a/src/afl-forkserver.c
++++ b/src/afl-forkserver.c
+@@ -371,6 +371,127 @@ restart_select:
+ /* Internal forkserver for non_instrumented_mode=1 and non-forkserver mode runs.
+   It execvs for each fork, forwarding exit codes and child pids to afl. */
+ 
++// This one is for the AFL-instrumented binary used for filtering
++static void orig_afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
++  pid_t child_pid;
++
++  void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
++
++  while (1) {
++    uint32_t was_killed;
++    u32      status;
++
++    /* Wait for parent by reading from the pipe. Exit if read fails. */
++
++    if (read(ORIG_FORKSRV_FD, &was_killed, 4) != 4) { exit(0); }
++
++    /* Create a clone of our process. */
++
++    child_pid = fork();
++
++    if (child_pid < 0) { PFATAL("Fork failed"); }
++
++    /* In child process: close fds, resume execution. */
++
++    if (!child_pid) {  // New child
++
++      close(fsrv->out_dir_fd);
++      close(fsrv->dev_null_fd);
++      close(fsrv->dev_urandom_fd);
++
++      if (fsrv->plot_file != NULL) {
++        fclose(fsrv->plot_file);
++        fsrv->plot_file = NULL;
++      }
++
++      // enable terminating on sigpipe in the childs
++      struct sigaction sa;
++      memset((char *)&sa, 0, sizeof(sa));
++      sa.sa_handler = SIG_DFL;
++      sigaction(SIGPIPE, &sa, NULL);
++
++      signal(SIGCHLD, old_sigchld_handler);
++
++      // ORIG_FORKSRV_FD is for communication with AFL, we don't need it in the
++      // child
++      close(ORIG_FORKSRV_FD);
++      close(ORIG_FORKSRV_FD + 1);
++      fsrv->target_path = fsrv->afl_put_bin_path;
++      argv[0] = fsrv->afl_put_bin_path;
++      // fsrv->target_path = fsrv->afl_put_bin_path;
++      // argv[0] = fsrv->afl_put_bin_path;
++
++      // finally: exec...
++      execv(fsrv->target_path, argv);
++
++      /* Use a distinctive bitmap signature to tell the parent about execv()
++        falling through. */
++
++      *(u32 *)fsrv->trace_bits = EXEC_FAIL_SIG;
++
++      WARNF("Execv failed in fauxserver.");
++      break;
++    }
++
++    /* In parent process: write PID to AFL. */
++
++    if (write(ORIG_FORKSRV_FD + 1, &child_pid, 4) != 4) { exit(0); }
++
++    /* after child exited, get and relay exit status to parent through waitpid.
++     */
++
++    if (waitpid(child_pid, &status, 0) < 0) {
++      // Zombie Child could not be collected. Scary!
++      WARNF("Fauxserver could not determine child's exit code. ");
++    }
++
++    /* Relay wait status to AFL pipe, then loop back. */
++
++    if (write(ORIG_FORKSRV_FD + 1, &status, 4) != 4) { exit(1); }
++  }
++}
++
++static void start_afl_filter_server(afl_forkserver_t *fsrv, char **argv) {
++  // fprintf(stderr, "Client: Server Wakeup Request\n");
++  s32 ctl_fd[2], st_fd[2];
++  if (pipe(ctl_fd) < 0 || pipe(st_fd) < 0) {
++    PFATAL("estimator server pipe() failed");
++  }
++  fsrv->afl_filter_pid = fork();
++
++  if (fsrv->afl_filter_pid < 0) { PFATAL("estimator server fork() failed"); }
++
++  if (!fsrv->afl_filter_pid) {  // server
++    close(ctl_fd[1]);
++    close(st_fd[0]);
++
++    dup2(ctl_fd[0], ORIG_FORKSRV_FD);
++    dup2(st_fd[1], ORIG_FORKSRV_FD + 1);
++
++    close(ctl_fd[0]);
++    close(st_fd[1]);
++
++    // discard stdout/stderr
++    close(fsrv->out_dir_fd);
++    close(fsrv->dev_null_fd);
++    close(fsrv->dev_urandom_fd);
++
++    close(STDOUT_FILENO);
++    close(STDERR_FILENO);
++
++    orig_afl_fauxsrv_execv(fsrv, argv);
++
++    perror("afl_filter_server");
++    FATAL("afl_filter_server failed in estimator script.");
++  }
++
++  close(ctl_fd[0]);
++  close(st_fd[1]);
++
++  fsrv->afl_filter_ctl_fd = ctl_fd[1];
++  fsrv->afl_filter_st_fd = st_fd[0];
++}
++
+ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
+ 
+   unsigned char tmp[4] = {0, 0, 0, 0};
+@@ -388,7 +509,8 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
+   }
+ 
+   void (*old_sigchld_handler)(int) = signal(SIGCHLD, SIG_DFL);
+-
++  u8  *stdout_fn = alloc_printf("%s/stdout.txt", fsrv->out_dir_path);
++  u8  *stderr_fn = alloc_printf("%s/stderr.txt", fsrv->out_dir_path);
+   while (1) {
+ 
+     uint32_t was_killed;
+@@ -408,8 +530,17 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
+ 
+     if (!child_pid) {  // New child
+ 
+-      close(fsrv->out_dir_fd);
+-      close(fsrv->dev_null_fd);
++      int stdout_fd =
++          open(stdout_fn, O_CREAT | O_TRUNC | O_WRONLY, DEFAULT_PERMISSION);
++      int stderr_fd =
++          open(stderr_fn, O_CREAT | O_TRUNC | O_WRONLY, DEFAULT_PERMISSION);
++      if (stdout_fd < 0 || stderr_fd < 0) {
++        perror("open");
++        FATAL("open() for logging failed");
++      }
++
++      // close(fsrv->out_dir_fd);
++      // close(fsrv->dev_null_fd);
+       close(fsrv->dev_urandom_fd);
+ 
+       if (fsrv->plot_file != NULL) {
+@@ -419,6 +550,15 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
+ 
+       }
+ 
++      // record stdout/stderr to separate files
++      if (dup2(stdout_fd, STDOUT_FILENO) < 0 ||
++          dup2(stderr_fd, STDERR_FILENO) < 0) {
++        perror("dup2");
++        FATAL("dup2() for response redirection failed");
++      }
++      close(stdout_fd);
++      close(stderr_fd);
++
+       // enable terminating on sigpipe in the childs
+       struct sigaction sa;
+       memset((char *)&sa, 0, sizeof(sa));
+@@ -464,7 +604,8 @@ static void afl_fauxsrv_execv(afl_forkserver_t *fsrv, char **argv) {
+     if (write(FORKSRV_FD + 1, &status, 4) != 4) { exit(1); }
+ 
+   }
+-
++  free(stdout_fn);
++  free(stderr_fn);
+ }
+ 
+ /* Report on the error received via the forkserver controller and exit */
+@@ -515,6 +656,56 @@ static void report_error_and_exit(int error) {
+ 
+ }
+ 
++static void shepherd_start_estimator_server(afl_forkserver_t *fsrv) {
++  // fprintf(stderr, "Client: Server Wakeup Request\n");
++  s32 ctl_fd[2], st_fd[2];
++  if (pipe(ctl_fd) < 0 || pipe(st_fd) < 0) {
++    PFATAL("estimator server pipe() failed");
++  }
++  fsrv->shepherd_pid = fork();
++
++  if (fsrv->shepherd_pid < 0) { PFATAL("estimator server fork() failed"); }
++
++  if (!fsrv->shepherd_pid) {  // server
++    close(ctl_fd[1]);
++    close(st_fd[0]);
++
++    dup2(ctl_fd[0], 88);
++    dup2(st_fd[1], 89);
++
++    close(ctl_fd[0]);
++    close(st_fd[1]);
++
++    // discard stdout/stderr
++    close(fsrv->out_dir_fd);
++    dup2(fsrv->dev_null_fd, 1);
++    // dup2(fsrv->dev_null_fd, 2);
++    close(fsrv->dev_null_fd);
++
++    u8 *estimator_path = getenv("FUZZ_SHEPHERD_PATH");
++    if (!estimator_path) { FATAL("FUZZ_SHEPHERD_PATH env var not set"); }
++
++    if (fsrv->enable_py_assert) {
++      char *args[] = {"/usr/bin/pypy3", estimator_path, NULL};
++      execv(args[0], args);
++    } else {
++      char *args[] = {"/usr/bin/pypy3", "-O", estimator_path, NULL};
++      execv(args[0], args);
++    }
++    perror("execv");
++    FATAL("Execv failed in estimator script.");
++  }
++
++  close(ctl_fd[0]);
++  close(st_fd[1]);
++
++  fsrv->shepherd_ctl_fd = ctl_fd[1];
++  fsrv->shepherd_st_fd = st_fd[0];
++
++  // fcntl(ctl_fd[1], F_SETFD, O_NONBLOCK);
++  // fcntl(st_fd[0], F_SETFD, O_NONBLOCK);
++}
++
+ /* Spins up fork server. The idea is explained here:
+ 
+    https://lcamtuf.blogspot.com/2014/10/fuzzing-binaries-without-execve.html
+@@ -834,6 +1025,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
+     if (!be_quiet) { ACTF("Using AFL++ faux forkserver..."); }
+     fsrv->init_child_func = afl_fauxsrv_execv;
+ 
++    if (!fsrv->is_baseline_mode) { shepherd_start_estimator_server(fsrv); }
++    start_afl_filter_server(fsrv, argv);
+   }
+ 
+   if (pipe(st_pipe) || pipe(ctl_pipe)) { PFATAL("pipe() failed"); }
+@@ -1681,11 +1874,151 @@ u32 afl_fsrv_get_mapsize(afl_forkserver_t *fsrv, char **argv,
+ 
+ }
+ 
++static void minimize_bits(afl_forkserver_t *fsrv, u8 *src) {
++  u32 i = 0;
++
++  while (i < fsrv->map_size) {
++    src[i] = src[i] != 0;
++    ++i;
++  }
++}
++
++/* Updates the virgin bits, then reflects whether a new count or a new tuple is
++ * seen in ret. */
++static inline void discover_word(u8 *ret, u64 *current, u64 *virgin) {
++  /* Optimize for (*current & *virgin) == 0 - i.e., no bits in current bitmap
++     that have not been already cleared from the virgin map - since this will
++     almost always be the case. */
++
++  if (*current & *virgin) {
++    if (likely(*ret < 2)) {
++      u8 *cur = (u8 *)current;
++      u8 *vir = (u8 *)virgin;
++
++      /* Looks like we have not found any new bytes yet; see if any non-zero
++         bytes in current[] are pristine in virgin[]. */
++
++      if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
++          (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff) ||
++          (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
++          (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff))
++        *ret = 2;
++      else
++        *ret = 1;
++    }
++
++    *virgin &= ~*current;
++  }
++}
++/* See has_new_bits in src/afl-fuzz-bitmap.c */
++static bool afl_has_new_bits(afl_forkserver_t *fsrv) {
++  u64 *current = (u64 *)fsrv->trace_bits;
++  u64 *virgin = (u64 *)fsrv->virgin_bits;
++
++  u32 i = ((fsrv->real_map_size + 7) >> 3);
++
++  u8 ret = 0;
++  while (i--) {
++    if (unlikely(*current)) discover_word(&ret, current, virgin);
++
++    current++;
++    virgin++;
++  }
++
++  return ret;
++}
++
++// return true if the input is interesting
++static bool filter_by_afl_put_bin(afl_forkserver_t *fsrv) {
++  memset(fsrv->trace_bits, 0, fsrv->map_size);
++  MEM_BARRIER();
++  u32 write_value = 0;  // fsrv->last_run_timed_out;
++
++  s32 res;
++  if ((res = write(fsrv->afl_filter_ctl_fd, &write_value, 4)) != 4) {
++    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
++  }
++  if ((res = read(fsrv->afl_filter_st_fd, &fsrv->afl_filter_child_pid, 4)) !=
++      4) {
++    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
++  }
++  volatile u8 stop_soon = 0;
++  s32         timeout = fsrv->exec_tmout;
++  s32         exec_ms =
++      read_s32_timed(fsrv->afl_filter_st_fd, &write_value, timeout, &stop_soon);
++
++  if (exec_ms > timeout) {
++    /* If there was no response from forkserver after timeout milliseconds,
++    we kill the child. The forkserver should inform us afterwards */
++
++    s32 tmp_pid = fsrv->afl_filter_child_pid;
++    if (tmp_pid > 0) {
++      kill(tmp_pid, fsrv->child_kill_signal);
++      fsrv->afl_filter_child_pid = -1;
++    }
++
++    fsrv->last_run_timed_out = 1;
++    s32 status = 0;
++    if (read(fsrv->afl_filter_st_fd, &status, 4) < 4) { exec_ms = 0; }
++  }
++
++  if (!exec_ms) {
++    if (stop_soon) { return 0; }
++    SAYF("\n" cLRD "[-] " cRST
++         "Unable to communicate with fork server. Some possible reasons:\n\n"
++         "    - You've run out of memory. Use -m to increase the the memory "
++         "limit\n"
++         "      to something higher than %llu.\n"
++         "    - The binary or one of the libraries it uses manages to "
++         "create\n"
++         "      threads before the forkserver initializes.\n"
++         "    - The binary, at least in some circumstances, exits in a way "
++         "that\n"
++         "      also kills the parent process - raise() could be the "
++         "culprit.\n"
++         "    - If using persistent mode with QEMU, "
++         "AFL_QEMU_PERSISTENT_ADDR "
++         "is\n"
++         "      probably not valid (hint: add the base address in case of "
++         "PIE)"
++         "\n\n"
++         "If all else fails you can disable the fork server via "
++         "AFL_NO_FORKSRV=1.\n",
++         fsrv->mem_limit);
++    RPFATAL(res, "Unable to communicate with fork server");
++  }
++
++  minimize_bits(fsrv, fsrv->trace_bits);
++  return afl_has_new_bits(fsrv);
++}
++
++static void save_testcase_to_file(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
++  if (!fsrv->afl_put_bin_path || !filter_by_afl_put_bin(fsrv)) return;
++  u64      cur_time = get_cur_time();
++  u64      time_diff = cur_time - fsrv->start_time;
++  u64      cksum = hash64(buf, len, HASH_CONST);
++  khiter_t iter = kh_get(u64_u64HashTable, fsrv->testcase_hashes, cksum);
++  if (iter != kh_end(fsrv->testcase_hashes)) return;
++  iter = kh_put(u64_u64HashTable, fsrv->testcase_hashes, cksum, &iter);
++  kh_value(fsrv->testcase_hashes, iter) = 1;
++
++  static u32 testcase_id = 0;
++  u8 *fn = alloc_printf("%s/inputs/id:%08u-T%llu-E%llu.txt", fsrv->out_dir_path,
++                        testcase_id, time_diff, fsrv->total_execs);
++  testcase_id++;
++  s32 fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
++  if (fd < 0) { PFATAL("Unable to create '%s'", fn); }
++  ck_write(fd, buf, len, fn);
++  close(fd);
++  // fprintf(stderr, "Saving testcase to %s with hash %llu\n", fn, cksum);
++
++  ck_free(fn);
++}
++
+ /* Delete the current testcase and write the buf to the testcase file */
+ 
+ void __attribute__((hot))
+ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
+-
+ #ifdef __linux__
+   if (unlikely(fsrv->nyx_mode)) {
+ 
+@@ -1797,6 +2130,40 @@ afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len) {
+ 
+   }
+ 
++  save_testcase_to_file(fsrv, buf, len);
++}
++
++static inline void update_shepherd_coverage(afl_forkserver_t *fsrv) {
++  // stdout/stderr recorded, so we call the path estimator
++  // NOTE: We assume the script finishes successfully
++
++  // send signal to the fuzz server
++  if (write(fsrv->shepherd_ctl_fd, "HOW\n", 4) != 4) {
++    FATAL("Failed to send signal to estimator child");
++  }
++
++  char buf[4];
++  if (read(fsrv->shepherd_st_fd, buf, 4) != 4) {
++    FATAL("Failed to read from estimator child");
++  }
++
++  // Now we assume the estimator script updated the edge-info file
++  FILE *file = fopen(fsrv->edges_file_path, "r");
++  if (!file) {
++    perror("fopen");
++    FATAL("Failed to open file");
++  }
++
++  u8 line[64];
++
++  while (fgets(line, sizeof(line), file)) {
++    u64 edge;
++    if (sscanf(line, "%llx", &edge) != 1) { FATAL("Failed to parse edge"); }
++    u64 shmap_idx = edge % fsrv->map_size;
++    fsrv->trace_bits[shmap_idx] = 1;
++  }
++
++  fclose(file);
+ }
+ 
+ /* Execute target application, monitoring for timeouts. Return status
+@@ -1992,6 +2359,7 @@ afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
+     RPFATAL(res, "Unable to communicate with fork server");
+ 
+   }
++  if (!fsrv->is_baseline_mode) update_shepherd_coverage(fsrv);
+ 
+   if (!WIFSTOPPED(fsrv->child_status)) { fsrv->child_pid = -1; }
+ 
+diff --git a/src/afl-fuzz-init.c b/src/afl-fuzz-init.c
+index 7310e49..a657cf9 100644
+--- a/src/afl-fuzz-init.c
++++ b/src/afl-fuzz-init.c
+@@ -1955,6 +1955,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
+   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
+   ck_free(fn);
+ 
++  fn = alloc_printf("%s/inputs", afl->out_dir);
++  if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
++  ck_free(fn);
++
+   /* All right, let's do <afl->out_dir>/crashes/id:* and
+    * <afl->out_dir>/hangs/id:*. */
+ 
+@@ -2215,6 +2219,12 @@ void setup_dirs_fds(afl_state_t *afl) {
+   if (mkdir(tmp, 0700)) { PFATAL("Unable to create '%s'", tmp); }
+   ck_free(tmp);
+ 
++  /* save inputs for baseline evaluation */
++
++  tmp = alloc_printf("%s/inputs", afl->out_dir);
++  if (mkdir(tmp, 0700)) { PFATAL("Unable to create '%s'", tmp); }
++  ck_free(tmp);
++
+   /* Top-level directory for queue metadata used for session
+      resume and related tasks. */
+ 
+diff --git a/src/afl-fuzz-run.c b/src/afl-fuzz-run.c
+index 6a0da6a..8046362 100644
+--- a/src/afl-fuzz-run.c
++++ b/src/afl-fuzz-run.c
+@@ -516,10 +516,11 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
+ 
+     if (!afl->non_instrumented_mode && !afl->stage_cur &&
+         !count_bytes(afl, afl->fsrv.trace_bits)) {
++      // We hijack AFL++'s coverage update logic and it does not adhere to the
++      // instrumentation-based sane methods
+ 
+-      fault = FSRV_RUN_NOINST;
+-      goto abort_calibration;
+-
++      // fault = FSRV_RUN_NOINST;
++      // goto abort_calibration;
+     }
+ 
+ #ifdef INTROSPECTION
+diff --git a/src/afl-fuzz.c b/src/afl-fuzz.c
+index a7ddef6..761f3cc 100644
+--- a/src/afl-fuzz.c
++++ b/src/afl-fuzz.c
+@@ -546,6 +546,7 @@ int main(int argc, char **argv_orig, char **envp) {
+ 
+   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
+ 
++  afl->non_instrumented_mode = !!getenv("FUZZ_BASELINE");
+   // still available: HjJkKqruvwz
+   while ((opt = getopt(argc, argv,
+                        "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:l:L:m:M:nNo:Op:P:QRs:S:t:"
+@@ -2274,8 +2275,10 @@ int main(int argc, char **argv_orig, char **envp) {
+   }
+ 
+   afl->argv = use_argv;
+-  afl->fsrv.trace_bits =
+-      afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode);
++  afl->fsrv.afl_argv = use_argv;
++  // NOTE: We always open shared memory, whenever the coverage should be
++  // discarded, we just memset it
++  afl->fsrv.trace_bits = afl_shm_init(&afl->shm, afl->fsrv.map_size, 0);
+ 
+   if (!afl->non_instrumented_mode && !afl->fsrv.qemu_mode &&
+       !afl->unicorn_mode && !afl->fsrv.frida_mode && !afl->fsrv.cs_mode &&
+@@ -2326,8 +2329,7 @@ int main(int argc, char **argv_orig, char **envp) {
+       afl_fsrv_kill(&afl->fsrv);
+       afl_shm_deinit(&afl->shm);
+       afl->fsrv.map_size = new_map_size;
+-      afl->fsrv.trace_bits =
+-          afl_shm_init(&afl->shm, new_map_size, afl->non_instrumented_mode);
++      afl->fsrv.trace_bits = afl_shm_init(&afl->shm, new_map_size, 0);
+       setenv("AFL_NO_AUTODICT", "1", 1);  // loaded already
+       afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
+                      afl->afl_env.afl_debug_child);
+@@ -2406,8 +2408,7 @@ int main(int argc, char **argv_orig, char **envp) {
+       map_size = new_map_size;
+ 
+       setenv("AFL_NO_AUTODICT", "1", 1);  // loaded already
+-      afl->fsrv.trace_bits =
+-          afl_shm_init(&afl->shm, new_map_size, afl->non_instrumented_mode);
++      afl->fsrv.trace_bits = afl_shm_init(&afl->shm, new_map_size, 0);
+       afl->cmplog_fsrv.trace_bits = afl->fsrv.trace_bits;
+       afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
+                      afl->afl_env.afl_debug_child);
+@@ -2469,6 +2470,22 @@ int main(int argc, char **argv_orig, char **envp) {
+   memset(afl->virgin_tmout, 255, map_size);
+   memset(afl->virgin_crash, 255, map_size);
+ 
++  // TODO: This is a hack for future concurrent testing
++  // out_dir_path is actually set up for nyx_mode and we repurpose that
++  afl->fsrv.out_dir_path = afl->out_dir;
++  // Pass the current afl-fuzz's output directory to the shepherd script
++  setenv("FUZZ_OUT_DIR_PATH", afl->out_dir, 1);
++  // saving the path to the output of shepherd script. We allocate here for fewer
++  // malloc
++  afl->fsrv.edges_file_path = alloc_printf("%s/edges.txt", afl->out_dir);
++  afl->fsrv.is_baseline_mode = getenv("FUZZ_BASELINE") != NULL;
++  afl->fsrv.enable_py_assert = getenv("FUZZ_PY_ASSERT") != NULL;
++  afl->fsrv.testcase_hashes = kh_init(u64_u64HashTable);
++  afl->fsrv.afl_put_bin_path = getenv("FUZZ_PUT_BIN");
++  afl->fsrv.virgin_bits = ck_alloc(map_size);
++  afl->fsrv.start_time = get_cur_time();
++  memset(afl->fsrv.virgin_bits, 255, map_size);
++
+   if (likely(!afl->afl_env.afl_no_startup_calibration)) {
+ 
+     perform_dry_run(afl);

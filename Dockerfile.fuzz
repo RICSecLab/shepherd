@@ -1,0 +1,58 @@
+FROM ubuntu:22.04
+
+ARG UID=1000
+RUN useradd --shell /bin/bash -u $UID -o -c "" -m myuser \
+    && mkdir work
+
+RUN apt-get update \
+    && apt-get install -y --no-install-suggests --no-install-recommends wget curl
+
+COPY --from=ghcr.io/astral-sh/uv:0.7.11 /uv /uvx /bin/
+
+RUN wget --no-check-certificate https://software.intel.com/sites/landingpage/pintool/downloads/pin-external-3.31-98861-g71afcc22f-gcc-linux.tar.gz \
+    && tar zxvf pin-external-3.31-98861-g71afcc22f-gcc-linux.tar.gz \
+    && rm pin-external-3.31-98861-g71afcc22f-gcc-linux.tar.gz
+
+ENV PATH=$PATH:/pin-external-3.31-98861-g71afcc22f-gcc-linux
+ENV PINTOOLS_DIR=/pin-external-3.31-98861-g71afcc22f-gcc-linux/source/tools/MyPinTool/
+
+RUN apt-get update && apt-get install -y --no-install-suggests --no-install-recommends \
+    python3 python3-pip pypy3 pypy3-dev graphviz git make gcc build-essential python3-dev automake cmake flex bison libglib2.0-dev libpixman-1-dev python3-setuptools libgtk-3-dev unzip vim hyperfine gdb
+
+COPY requirements.txt /requirements.txt
+RUN UV_PYTHON=python3 uv pip install --system -r requirements.txt
+RUN UV_PYTHON=pypy3 uv pip install --system -r requirements.txt
+
+WORKDIR /work
+RUN cd /work \
+    && mkdir tmp_project \
+    && mkdir /tmp/edges \
+    && mkdir /tmp/output \
+    && chown myuser. /work -R \
+    && chown myuser. /tmp/edges -R \
+    && chown myuser. /tmp/output -R \
+    && chown myuser. /pin-external-3.31-98861-g71afcc22f-gcc-linux -R
+
+RUN git clone https://github.com/AFLplusplus/AFLplusplus -b v4.21c --depth 1 && \
+    git clone /work/AFLplusplus /work/AFLplusplus_unpatched
+
+COPY aflpp_patch /work/aflpp_patch
+RUN cd AFLplusplus \
+    && git apply /work/aflpp_patch/coverage.patch \
+    && gmake afl-fuzz \
+    && cd ../AFLplusplus_unpatched \
+    && gmake afl-fuzz
+
+RUN apt-get update && apt-get install -y --no-install-suggests --no-install-recommends \
+    libpopt-dev protobuf-compiler libprotobuf-dev libprotobuf-c-dev libprotobuf-c1 \
+    libprotobuf-lite23 libprotobuf23
+
+RUN apt-get install -y --no-install-suggests --no-install-recommends \
+    texinfo libpng-dev libjpeg-dev libtiff-dev libwebp-dev
+
+RUN apt-get install -y libmaxminddb0 libmaxminddb-dev
+RUN apt-get install -y libfontconfig1-dev libfreetype-dev libxml2-dev libssl-dev libjpeg-dev libpng-dev libtiff-dev libidn11-dev
+
+USER myuser
+
+CMD ./docker_script.sh
